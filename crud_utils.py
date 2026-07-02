@@ -1,10 +1,5 @@
 from __future__ import annotations
-
 import decimal
-
-
-
-
 import pandas as pd
 import panel as pn
 from sqlalchemy import MetaData, Table, delete, select
@@ -13,14 +8,12 @@ from sqlalchemy.exc import NoSuchTableError
 
 pn.extension("tabulator")
 
-
 def _reflect_table(engine, table_name: str) -> Table:
     metadata = MetaData()
     try:
         return Table(table_name, metadata, autoload_with=engine)
     except NoSuchTableError:
         return Table(table_name.lower(), metadata, autoload_with=engine)
-
 
 def _load_dataframe(engine, table: Table) -> pd.DataFrame:
     with engine.connect() as conn:
@@ -33,7 +26,6 @@ def _load_dataframe(engine, table: Table) -> pd.DataFrame:
 
     return df
 
-
 def _empty_row(table: Table) -> dict:
     row = {}
     for col in table.columns:
@@ -45,7 +37,6 @@ def _empty_row(table: Table) -> dict:
             row[col.name] = ""
     return row
 
-
 def build_crud_section(engine, table_name: str, title: str | None = None) -> pn.Column:
     table = _reflect_table(engine, table_name)
     pk_cols = [c.name for c in table.primary_key.columns]
@@ -54,7 +45,7 @@ def build_crud_section(engine, table_name: str, title: str | None = None) -> pn.
 
     status = pn.pane.Markdown("", margin=(0, 0, 5, 0))
 
-    editors = {pk: None for pk in pk_cols}
+    editors = {}
 
     tabulator = pn.widgets.Tabulator(
         df_inicial,
@@ -79,11 +70,10 @@ def build_crud_section(engine, table_name: str, title: str | None = None) -> pn.
     def adicionar_linha(_event=None):
         nova_linha = pd.DataFrame([_empty_row(table)])
         tabulator.value = pd.concat([tabulator.value, nova_linha], ignore_index=True)
-        status.object = "Linha em branco adicionada. Preencha os campos e clique em **Salvar alterações**."
+        status.object = "Linha em branco adicionada. Preencha os campos (aperte ENTER em cada um) e clique em **Salvar alterações**."
 
     def salvar(_event=None):
         df = tabulator.value.copy()
-        # troca NaN/strings vazias em colunas que aceitam NULL por None
         df = df.where(pd.notnull(df), None)
         df = df.replace("", None)
 
@@ -92,6 +82,21 @@ def build_crud_section(engine, table_name: str, title: str | None = None) -> pn.
             for _, row in df.iterrows():
                 valores = row.to_dict()
                 
+                # Traduz os números do Pandas/Numpy para o Python nativo (Evita o can't adapt type)
+                for k, v in valores.items():
+                    if hasattr(v, 'item'):
+                        valores[k] = v.item()
+                    elif pd.isna(v):
+                        valores[k] = None
+
+                for col in table.columns:
+                    val = valores.get(col.name)
+                    if val is not None:
+                        if "INT" in str(col.type).upper():
+                            valores[col.name] = int(float(val))
+                        elif "NUMERIC" in str(col.type).upper() or "DECIMAL" in str(col.type).upper():
+                            valores[col.name] = float(val)
+
                 if any(valores.get(pk) in (None, 0) for pk in pk_cols):
                     if all(v in (None, 0, "") for v in valores.values()):
                         continue
@@ -111,7 +116,7 @@ def build_crud_section(engine, table_name: str, title: str | None = None) -> pn.
 
                 try:
                     conn.execute(stmt)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     erros.append(f"PK {[valores.get(pk) for pk in pk_cols]}: {exc}")
 
         if erros:
@@ -127,16 +132,31 @@ def build_crud_section(engine, table_name: str, title: str | None = None) -> pn.
             return
 
         df = tabulator.value
+        erros_remover = []
+        
         with engine.begin() as conn:
             for idx in selecionadas:
-                row = df.iloc[idx]
-                condicao = [table.c[pk] == row[pk] for pk in pk_cols]
-                cond = condicao[0]
-                for c in condicao[1:]:
-                    cond = cond & c
-                conn.execute(delete(table).where(cond))
+                try:
+                    row = df.iloc[idx]
+                    condicao = []
+                    for pk in pk_cols:
+                        val = row[pk]
+                        # Traduz o ID do Pandas para o Python nativo para o DELETE funcionar
+                        if hasattr(val, 'item'):
+                            val = val.item()
+                        condicao.append(table.c[pk] == val)
+                        
+                    cond = condicao[0]
+                    for c in condicao[1:]:
+                        cond = cond & c
+                    conn.execute(delete(table).where(cond))
+                except Exception as exc:
+                    erros_remover.append(f"Erro no índice {idx}: {exc}")
 
-        status.object = f"🗑️ {len(selecionadas)} registro(s) removido(s)."
+        if erros_remover:
+            status.object = "⚠️ Erro ao remover do banco:<br>" + "<br>".join(erros_remover)
+        else:
+            status.object = f"🗑️ {len(selecionadas)} registro(s) removido(s) com sucesso."
         recarregar()
 
     btn_recarregar.on_click(recarregar)
